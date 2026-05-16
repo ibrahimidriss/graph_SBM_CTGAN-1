@@ -1,0 +1,16 @@
+
+---
+
+# 📄 2. `requirements.txt`
+
+```txt
+pandas
+numpy
+networkx
+matplotlib
+python-louvain
+scipy
+sdv==1.9.0
+seaborn
+scikit-learn
+torch
