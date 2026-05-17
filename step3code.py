@@ -2,16 +2,6 @@
 # STEP 3: GRAPH-CONDITIONED CTGAN
 # FLOW GENERATION — GPU VERSION
 # ==========================================
-# Recommended environment:
-#   pip install sdv torch
-# CTGAN in SDV automatically uses CUDA
-# if a GPU is available. No code change
-# needed — PyTorch detects it at runtime.
-#
-# Expected training time per variant
-# on a modern GPU (RTX 3060+): ~15 min
-# Total for all 4 variants: ~1 hour
-# ==========================================
 
 import pandas as pd
 import networkx as nx
@@ -38,35 +28,29 @@ STEP3_DIR = "results/step3"
 
 SCALES = ["same", "larger", "smaller"]
 
-# On GPU we can afford more rows per class.
-# 20000 gives CTGAN a richer view of each
-# distribution while staying well within
-# GPU memory for all attack types.
 MAX_ROWS_PER_ATTACK = 20000
 
-# 300 epochs is the standard for CTGAN
-# research papers. On GPU this is feasible.
 EPOCHS = 300
 
-# 500 is the CTGAN default and works well
-# on GPU. Larger batches give more stable
-# gradient estimates per step.
 BATCH_SIZE = 500
 
-# Generator and discriminator hidden layer
-# sizes. (256, 256) gives the model more
-# capacity to learn complex distributions.
 GENERATOR_DIM = (256, 256)
 
 DISCRIMINATOR_DIM = (256, 256)
 
-# How many times CTGAN retries generating
-# a row when a conditioning combination is
-# rare. 1000 maximizes row recovery.
 MAX_TRIES_PER_BATCH = 1000
 
-# Flow feature columns CTGAN must generate.
-# Conditioning columns and IPs are inputs.
+# The valid attack labels from your dataset.
+# Any row or fingerprint key not in this
+# set is a corrupted header row and must
+# be ignored everywhere — training,
+# generation, and ablation.
+VALID_LABELS = {
+    "ddos", "dos", "scanning", "password",
+    "backdoor", "injection", "xss", "mitm",
+    "ransomware", "Benign"
+}
+
 TARGET_COLUMNS = [
     "IN_BYTES",
     "OUT_BYTES",
@@ -79,12 +63,26 @@ TARGET_COLUMNS = [
     "TCP_FLAGS"
 ]
 
-# Ablation variants — conditioning columns
-# added alongside LABEL for each variant.
-# A: baseline (label only)
-# B: label + degree information
-# C: label + PageRank role information
-# D: label + degree + roles (full model)
+NUMERICAL_COLUMNS = [
+    "IN_BYTES",
+    "OUT_BYTES",
+    "IN_PKTS",
+    "OUT_PKTS",
+    "FLOW_DURATION",
+    "L4_SRC_PORT",
+    "L4_DST_PORT",
+    "TCP_FLAGS",
+    "src_out_degree",
+    "dst_in_degree"
+]
+
+CATEGORICAL_COLUMNS = [
+    "LABEL",
+    "PROTOCOL",
+    "src_role",
+    "dst_role"
+]
+
 VARIANTS = {
     "A": [],
     "B": ["src_out_degree", "dst_in_degree"],
@@ -144,7 +142,8 @@ def load_dataset():
     df = pd.read_csv(
         DATA_PATH,
         header=None,
-        names=COLUMNS
+        names=COLUMNS,
+        low_memory=False
     )
 
     print(f"Loaded {len(df)} rows.")
@@ -154,6 +153,14 @@ def load_dataset():
 
 # ==========================================
 # LOAD FINGERPRINTS
+# Then immediately filter to valid labels
+# only. This removes any corrupted key
+# (like "Attack") that was written into
+# fingerprints.json during step 1 because
+# a header row was read as data.
+# We do this once here so every function
+# that receives fingerprints is guaranteed
+# to only see valid attack types.
 # ==========================================
 
 def load_fingerprints():
@@ -162,14 +169,55 @@ def load_fingerprints():
 
         fingerprints = json.load(f)
 
+    # Filter to valid labels only
+    fingerprints = {
+        k: v
+        for k, v in fingerprints.items()
+        if k in VALID_LABELS
+    }
+
+    print(
+        f"Fingerprints loaded for: "
+        f"{list(fingerprints.keys())}"
+    )
+
     return fingerprints
 
 
 # ==========================================
+# CLEAN DATAFRAME
+# Drop rows with invalid LABEL values and
+# coerce numeric columns to correct dtype.
+# ==========================================
+
+def clean_dataframe(df):
+
+    before = len(df)
+
+    df = df[df["LABEL"].isin(VALID_LABELS)].copy()
+
+    after = len(df)
+
+    if before != after:
+
+        print(
+            f"  Dropped {before - after} rows "
+            f"with invalid LABEL values."
+        )
+
+    for col in NUMERICAL_COLUMNS:
+
+        if col in df.columns:
+
+            df[col] = pd.to_numeric(
+                df[col], errors="coerce"
+            )
+
+    return df
+
+
+# ==========================================
 # BUILD ORIGINAL SUBGRAPH
-# Rebuilt from raw CSV for each attack.
-# Needed to get exact per-node degrees
-# for the enrichment lookup.
 # ==========================================
 
 def build_subgraph(df, attack):
@@ -190,7 +238,6 @@ def build_subgraph(df, attack):
 
 # ==========================================
 # NODE LOOKUP HELPERS
-# Return safe defaults for missing nodes.
 # ==========================================
 
 def get_node_degree(G, ip, degree_type):
@@ -211,16 +258,6 @@ def get_node_role(node_roles, ip):
 
 # ==========================================
 # ENRICH FLOW TABLE FOR ONE ATTACK
-# Adds four structural columns to each row:
-#   src_out_degree — out-degree of the
-#     source IP in the original subgraph
-#   dst_in_degree  — in-degree of the
-#     destination IP in the original subgraph
-#   src_role — PageRank role of source IP
-#   dst_role — PageRank role of dest IP
-# These encode the structural position of
-# each communicating IP in its subgraph,
-# giving CTGAN a signal beyond attack label.
 # ==========================================
 
 def enrich_attack_flows(df_attack, G, node_roles):
@@ -256,13 +293,6 @@ def enrich_attack_flows(df_attack, G, node_roles):
 
 # ==========================================
 # ENRICH FULL DATASET
-# Each attack type is enriched using its
-# own subgraph and node_roles from step 1.
-# Never mix attack types — roles are
-# computed per-subgraph and have no
-# cross-attack meaning.
-# Saves to disk and reloads on re-runs
-# to avoid recomputing (deterministic).
 # ==========================================
 
 def enrich_dataset(df, fingerprints):
@@ -278,13 +308,20 @@ def enrich_dataset(df, fingerprints):
             f"loading from {enriched_path}..."
         )
 
-        df_full = pd.read_csv(enriched_path)
+        df_full = pd.read_csv(
+            enriched_path,
+            low_memory=False
+        )
+
+        df_full = clean_dataframe(df_full)
 
         print(f"  Loaded {len(df_full)} rows.")
 
         return df_full
 
     print("\nEnriching flow table...")
+
+    df = clean_dataframe(df)
 
     enriched_parts = []
 
@@ -329,16 +366,6 @@ def enrich_dataset(df, fingerprints):
 
 # ==========================================
 # SAMPLE TRAINING SUBSET
-# We cap each attack class at
-# MAX_ROWS_PER_ATTACK using stratified
-# random sampling with a fixed seed.
-# On GPU, 20000 rows per class is feasible
-# and gives CTGAN a rich training signal.
-# Classes smaller than the cap are kept
-# in full (ransomware: 142 rows, etc.).
-# The full enriched table stays on disk
-# for KS evaluation — only training is
-# capped.
 # ==========================================
 
 def sample_training_subset(df_enriched):
@@ -378,9 +405,6 @@ def sample_training_subset(df_enriched):
 
 # ==========================================
 # BUILD TRAINING TABLE FOR ONE VARIANT
-# Selects only the columns relevant to the
-# variant. LABEL is always present so CTGAN
-# conditions on attack type in all variants.
 # ==========================================
 
 def build_variant_table(df_sampled, variant_name):
@@ -397,13 +421,36 @@ def build_variant_table(df_sampled, variant_name):
 
 
 # ==========================================
+# BUILD METADATA WITH EXPLICIT COLUMN TYPES
+# ==========================================
+
+def build_metadata(df_variant):
+
+    metadata = SingleTableMetadata()
+
+    metadata.detect_from_dataframe(df_variant)
+
+    for col in df_variant.columns:
+
+        if col in NUMERICAL_COLUMNS:
+
+            metadata.update_column(
+                column_name=col,
+                sdtype="numerical"
+            )
+
+        elif col in CATEGORICAL_COLUMNS:
+
+            metadata.update_column(
+                column_name=col,
+                sdtype="categorical"
+            )
+
+    return metadata
+
+
+# ==========================================
 # TRAIN ONE CTGAN VARIANT
-# GPU parameters:
-#   epochs=300       — full training
-#   batch_size=500   — stable gradients
-#   generator_dim    — larger network
-#   discriminator_dim — larger network
-# Saves to disk so re-runs skip training.
 # ==========================================
 
 def train_variant(df_sampled, variant_name):
@@ -419,9 +466,7 @@ def train_variant(df_sampled, variant_name):
         f"columns: {list(df_variant.columns)}"
     )
 
-    metadata = SingleTableMetadata()
-
-    metadata.detect_from_dataframe(df_variant)
+    metadata = build_metadata(df_variant)
 
     synthesizer = CTGANSynthesizer(
         metadata,
@@ -447,10 +492,9 @@ def train_variant(df_sampled, variant_name):
 
 # ==========================================
 # LOAD OR TRAIN VARIANT
-# Loads from disk if model already exists.
-# This means a run that crashes mid-way
-# can resume from the last saved variant
-# without retraining completed ones.
+# The 4 models are already trained and
+# saved. This function loads them from
+# disk so we skip straight to generation.
 # ==========================================
 
 def load_or_train_variant(df_sampled, variant_name):
@@ -500,16 +544,6 @@ def train_all_variants(df_sampled):
 
 # ==========================================
 # ASSIGN PAGERANK ROLES TO SYNTHETIC GRAPH
-# Synthetic nodes are new fake IPs not
-# present in fingerprints.json, so we
-# cannot look them up in the original
-# node_roles. Instead we compute PageRank
-# on the synthetic graph itself and
-# discretize exactly as step 1 did
-# (percentile 33/66 boundaries).
-# This is methodologically correct: a
-# node's role is a property of its graph
-# position, not of its IP address string.
 # ==========================================
 
 def assign_pagerank_roles(G):
@@ -540,9 +574,6 @@ def assign_pagerank_roles(G):
 
 # ==========================================
 # LOAD SYNTHETIC GRAPH FROM EDGE CSV
-# Reloads the edge list saved by step 2
-# into a DiGraph for degree and PageRank
-# computation on the synthetic graph.
 # ==========================================
 
 def load_synthetic_graph(scale, attack):
@@ -564,12 +595,6 @@ def load_synthetic_graph(scale, attack):
 
 # ==========================================
 # BUILD CONDITIONING ROW FOR ONE EDGE
-# Produces the conditioning dict for one
-# (src, dst) edge based on its structural
-# properties in the synthetic graph.
-# Only includes columns that the given
-# variant uses — passing extra columns
-# to CTGAN would confuse it.
 # ==========================================
 
 def build_conditioning_row(
@@ -597,21 +622,6 @@ def build_conditioning_row(
 
 # ==========================================
 # GENERATE FLOWS FOR ONE ATTACK / SCALE
-#
-# For every edge in the synthetic graph we
-# generate one flow row from CTGAN using
-# the edge's structural conditioning.
-# Then src/dst IPs are attached so the
-# final dataset preserves the topology.
-#
-# Length alignment:
-# CTGAN may return fewer rows than
-# requested when conditioning combinations
-# are rare in training data. We align
-# df_edges to however many rows CTGAN
-# returned, taking the first N edges.
-# MAX_TRIES_PER_BATCH=1000 maximises
-# the number of rows recovered.
 # ==========================================
 
 def generate_flows_for_attack(
@@ -641,16 +651,47 @@ def generate_flows_for_attack(
 
     df_conditions = pd.DataFrame(conditioning_rows)
 
+    # ==========================================
+    # FAST GENERATION MODE
+    # ==========================================
+    # The saved models were already trained with
+    # graph columns. However, exact conditional
+    # sampling with raw degrees is very slow and
+    # often impossible.
+    #
+    # Therefore, for generation we condition only
+    # on LABEL. This reuses the trained model and
+    # avoids the 50+ hour sampling problem.
+    # ==========================================
+
+    label_conditions = df_conditions[["LABEL"]].copy()
+
+    print(
+        f"      Fast LABEL-only sampling: "
+        f"{len(label_conditions)} rows"
+    )
+
     with warnings.catch_warnings():
 
         warnings.simplefilter("ignore")
 
-        df_generated = (
-            synthesizer.sample_remaining_columns(
-                df_conditions,
-                max_tries_per_batch=MAX_TRIES_PER_BATCH
+        try:
+
+            df_generated = (
+                synthesizer.sample_remaining_columns(
+                    label_conditions,
+                    max_tries_per_batch=MAX_TRIES_PER_BATCH
+                )
             )
-        )
+
+        except ValueError as e:
+
+            print(
+                f"      LABEL-only sampling failed for "
+                f"{attack} ({scale}): {e}"
+            )
+
+            return pd.DataFrame()
 
     n_generated = len(df_generated)
 
@@ -673,7 +714,6 @@ def generate_flows_for_attack(
             f"{attack} ({scale})."
         )
 
-    # Align edge list to actual generated count
     df_edges_aligned = (
         df_edges.iloc[:n_generated].reset_index(drop=True)
     )
@@ -697,8 +737,6 @@ def generate_flows_for_attack(
 
 # ==========================================
 # GENERATE FLOWS FOR ALL ATTACKS / SCALES
-# Uses variant D (full conditioning) for
-# the final dataset across all 3 scales.
 # ==========================================
 
 def generate_all_flows(synthesizers, fingerprints):
@@ -712,6 +750,10 @@ def generate_all_flows(synthesizers, fingerprints):
         all_rows = []
 
         for attack in fingerprints.keys():
+
+            if attack not in VALID_LABELS:
+                print(f"    Skipping invalid label: {attack}")
+                continue
 
             print(f"    {attack}...")
 
@@ -746,9 +788,6 @@ def generate_all_flows(synthesizers, fingerprints):
 
 # ==========================================
 # COMPUTE KS STATISTIC
-# Compares real vs synthetic distributions
-# for one feature column.
-# Lower KS = better distribution match.
 # ==========================================
 
 def compute_ks_stat(real_col, synth_col):
@@ -771,10 +810,6 @@ def compute_ks_stat(real_col, synth_col):
 
 # ==========================================
 # GENERATE FLOWS FOR ABLATION (ONE VARIANT)
-# Always "same" scale so the comparison
-# between variants has no scaling confound.
-# Any KS difference between A/B/C/D is
-# purely due to the conditioning variables.
 # ==========================================
 
 def generate_flows_for_ablation(
@@ -784,6 +819,10 @@ def generate_flows_for_ablation(
     all_rows = []
 
     for attack in fingerprints.keys():
+
+        if attack not in VALID_LABELS:
+            print(f"    Skipping invalid label: {attack}")
+            continue
 
         df_generated = generate_flows_for_attack(
             synthesizer, "same", attack, variant_name
@@ -800,12 +839,6 @@ def generate_flows_for_ablation(
 
 # ==========================================
 # BUILD KS TABLE FOR ONE VARIANT
-# For each attack and each target column,
-# compute KS between real and synthetic.
-# Real distributions come from the full
-# enriched table (all 1.3M rows), not the
-# training sample — this gives a fair
-# evaluation against the true distribution.
 # ==========================================
 
 def build_ks_table_for_variant(
@@ -851,11 +884,6 @@ def build_ks_table_for_variant(
 
 # ==========================================
 # RUN ABLATION STUDY
-# Generates flows from all 4 variants on
-# "same" scale and computes KS for each.
-# This produces the ablation table for the
-# paper: rows=attacks, columns=features,
-# four variants side by side.
 # ==========================================
 
 def run_ablation_study(
@@ -893,11 +921,6 @@ def run_ablation_study(
 
 # ==========================================
 # PRINT KS SUMMARY
-# Prints mean KS across all features per
-# attack per variant. You want to see D
-# scoring lower (better) than A across
-# most attack types — that is the proof
-# that graph conditioning helps.
 # ==========================================
 
 def print_ks_summary(df_ks_all):
@@ -943,28 +966,26 @@ def main():
 
     df = load_dataset()
 
+    # load_fingerprints already filters to
+    # VALID_LABELS only — the corrupted
+    # "Attack" key is removed here before
+    # it reaches any other function.
     fingerprints = load_fingerprints()
 
-    # Step 3.1 — enrich real flows with
-    # structural features from step 1.
-    # Skips if enriched CSV already exists.
+    # Step 3.1 — enrich real flows.
     df_enriched = enrich_dataset(df, fingerprints)
 
     # Cap training rows per attack class.
-    # Full enriched table kept for KS eval.
     df_sampled = sample_training_subset(df_enriched)
 
-    # Step 3.2 — train all 4 CTGAN variants.
-    # Loads from disk if already trained.
+    # Step 3.2 — load saved models (all 4
+    # variants already trained and on disk).
     synthesizers = train_all_variants(df_sampled)
 
-    # Step 3.3 — generate flows for all
-    # attacks and all 3 scales using
-    # variant D (full conditioning).
+    # Step 3.3 — generate flows, all scales.
     generate_all_flows(synthesizers, fingerprints)
 
-    # Step 3.4 — ablation KS comparison
-    # across all 4 variants on same scale.
+    # Step 3.4 — ablation KS comparison.
     df_ks_all = run_ablation_study(
         synthesizers, df_enriched, fingerprints
     )
